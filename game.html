@@ -1,0 +1,212 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Star Dodger — built from one prompt</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #05070f; overflow: hidden; }
+  canvas { display: block; }
+</style>
+</head>
+<body>
+<canvas id="game" width="1920" height="1080"></canvas>
+<script>
+// Star Dodger: a tiny browser game. One prompt in, one game out.
+// A rocket weaves through an asteroid field. Autopilot flies it, so the
+// game plays itself — the point is the game, not the pilot.
+(function () {
+  var canvas = document.getElementById('game');
+  var ctx = canvas.getContext('2d');
+  var W = 1920, H = 1080;
+
+  // Seeded random, so every run plays the same field.
+  function mulberry32(seed) {
+    return function () {
+      seed |= 0; seed = (seed + 0x6D2B79F5) | 0;
+      var t = Math.imul(seed ^ (seed >>> 15), 1 | seed);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+  var rand = mulberry32(20261122);
+
+  // Starfield: 220 stars, slow parallax drift.
+  var stars = [];
+  for (var i = 0; i < 220; i++) {
+    stars.push({ x: rand() * W, y: rand() * H, r: rand() * 2 + 0.5, s: rand() * 18 + 6 });
+  }
+
+  var ship = { x: 420, y: H / 2, vy: 0, r: 16 };
+  var asteroids = [];
+  var spawnTimer = 0;
+  var score = 0;
+  var dodged = 0;
+  var speed = 340;           // field speed, px/s; ramps up as you survive
+  var elapsed = 0;
+  var last = performance.now();
+  var gameOver = false;
+  var overTimer = 0;
+
+  // Demo mode: a crash restarts the run after a beat, so the game always
+  // comes back — it is a game you can keep playing, not a dead end.
+  function resetRun() {
+    asteroids = [];
+    score = 0; dodged = 0; speed = 320; elapsed = 0;
+    spawnTimer = 0; gameOver = false; overTimer = 0;
+    ship.y = H / 2; ship.vy = 0;
+  }
+
+  function spawnAsteroid() {
+    var r = 22 + rand() * 30;
+    asteroids.push({
+      x: W + r + 40,
+      y: 70 + rand() * (H - 140),
+      r: r,
+      spin: (rand() - 0.5) * 1.6,
+      angle: rand() * Math.PI * 2,
+      jag: 0.75 + rand() * 0.4,
+      vy: (rand() - 0.5) * 60
+    });
+  }
+
+  // Autopilot: steer toward the y with the most room among the asteroids
+  // ahead. Candidates are sampled every 30 px; each is scored by its
+  // closest approach to any threat (nearer threats weigh more), with a
+  // mild pull back to mid-field so the ship does not hug the edges.
+  function autopilot(dt) {
+    var bestY = H / 2, bestScore = -1e9;
+    for (var y = 90; y <= H - 90; y += 30) {
+      var clearance = 1e9;
+      for (var i = 0; i < asteroids.length; i++) {
+        var a = asteroids[i];
+        if (a.x + a.r < ship.x - 40 || a.x - a.r > ship.x + 560) continue;
+        var near = 1 - Math.max(0, (a.x - ship.x) / 560); // 1 when on top of us
+        var gap = Math.abs(a.y - y) - a.r - 46;
+        clearance = Math.min(clearance, gap * (0.4 + 0.6 * near));
+      }
+      var score = clearance - 0.12 * Math.abs(y - H / 2);
+      if (score > bestScore) { bestScore = score; bestY = y; }
+    }
+    var dy = bestY - ship.y;
+    ship.vy += Math.max(-3200, Math.min(3200, dy * 11 - ship.vy * 3.6)) * dt;
+    ship.y += ship.vy * dt;
+    if (ship.y < 60) { ship.y = 60; ship.vy = 0; }
+    if (ship.y > H - 60) { ship.y = H - 60; ship.vy = 0; }
+  }
+
+  function drawShip() {
+    ctx.save();
+    ctx.translate(ship.x, ship.y);
+    // Flame, flickering with time.
+    var fl = 26 + Math.sin(elapsed * 31) * 8;
+    ctx.fillStyle = '#ff9a3c';
+    ctx.beginPath();
+    ctx.moveTo(-26, -9); ctx.lineTo(-26 - fl, 0); ctx.lineTo(-26, 9);
+    ctx.closePath(); ctx.fill();
+    // Rocket body.
+    ctx.fillStyle = '#e8ecf4';
+    ctx.beginPath();
+    ctx.moveTo(30, 0); ctx.lineTo(-20, -16); ctx.lineTo(-28, 0); ctx.lineTo(-20, 16);
+    ctx.closePath(); ctx.fill();
+    ctx.fillStyle = '#ff4d6d';
+    ctx.beginPath();
+    ctx.moveTo(30, 0); ctx.lineTo(2, -10); ctx.lineTo(2, 10);
+    ctx.closePath(); ctx.fill();
+    // Window.
+    ctx.fillStyle = '#38bdf8';
+    ctx.beginPath(); ctx.arc(6, 0, 6, 0, Math.PI * 2); ctx.fill();
+    ctx.restore();
+  }
+
+  function drawAsteroid(a) {
+    ctx.save();
+    ctx.translate(a.x, a.y);
+    ctx.rotate(a.angle);
+    ctx.fillStyle = '#8b7d6b';
+    ctx.beginPath();
+    for (var i = 0; i < 9; i++) {
+      var ang = (i / 9) * Math.PI * 2;
+      var rr = a.r * (0.82 + 0.18 * Math.sin(ang * 3 + a.jag * 9));
+      var px = Math.cos(ang) * rr, py = Math.sin(ang) * rr;
+      if (i === 0) ctx.moveTo(px, py); else ctx.lineTo(px, py);
+    }
+    ctx.closePath(); ctx.fill();
+    ctx.fillStyle = '#6b5f52';
+    ctx.beginPath(); ctx.arc(-a.r * 0.3, -a.r * 0.2, a.r * 0.25, 0, Math.PI * 2); ctx.fill();
+    ctx.beginPath(); ctx.arc(a.r * 0.35, a.r * 0.3, a.r * 0.18, 0, Math.PI * 2); ctx.fill();
+    ctx.restore();
+  }
+
+  function frame(now) {
+    var dt = Math.min(0.05, (now - last) / 1000);
+    last = now;
+    if (!gameOver) {
+      elapsed += dt;
+      speed = 320 + Math.min(240, elapsed * 8);
+      spawnTimer -= dt;
+      if (spawnTimer <= 0) { spawnAsteroid(); spawnTimer = 0.95; }
+      autopilot(dt);
+      for (var i = asteroids.length - 1; i >= 0; i--) {
+        var a = asteroids[i];
+        a.x -= speed * dt;
+        a.y += a.vy * dt;
+        a.angle += a.spin * dt;
+        if (a.x < -a.r - 60) { asteroids.splice(i, 1); dodged++; score = dodged; continue; }
+        var dx = a.x - ship.x, dy = a.y - ship.y;
+        if (dx * dx + dy * dy < (a.r * 0.8 + ship.r * 0.8) * (a.r * 0.8 + ship.r * 0.8)) {
+          gameOver = true;
+        }
+      }
+    } else {
+      overTimer += dt;
+      if (overTimer > 1.2) resetRun();
+    }
+
+    // Sky.
+    ctx.fillStyle = '#05070f';
+    ctx.fillRect(0, 0, W, H);
+    for (var s = 0; s < stars.length; s++) {
+      var st = stars[s];
+      st.x -= st.s * dt;
+      if (st.x < 0) { st.x = W; st.y = rand() * H; }
+      ctx.fillStyle = 'rgba(255,255,255,' + (0.35 + (st.r / 2.5) * 0.5) + ')';
+      ctx.beginPath(); ctx.arc(st.x, st.y, st.r, 0, Math.PI * 2); ctx.fill();
+    }
+
+    for (var j = 0; j < asteroids.length; j++) drawAsteroid(asteroids[j]);
+    drawShip();
+
+    // HUD.
+    ctx.fillStyle = 'rgba(255,255,255,0.92)';
+    ctx.font = '700 44px "DejaVu Sans Mono", monospace';
+    ctx.textAlign = 'left';
+    ctx.fillText('STAR DODGER', 48, 72);
+    ctx.font = '400 30px "DejaVu Sans Mono", monospace';
+    ctx.fillStyle = 'rgba(255,255,255,0.6)';
+    ctx.fillText('one prompt  →  one game', 48, 116);
+    ctx.textAlign = 'right';
+    ctx.fillStyle = 'rgba(255,255,255,0.92)';
+    ctx.font = '700 44px "DejaVu Sans Mono", monospace';
+    ctx.fillText('SCORE ' + score, W - 48, 72);
+    ctx.font = '400 28px "DejaVu Sans Mono", monospace';
+    ctx.fillStyle = 'rgba(255,255,255,0.6)';
+    ctx.fillText(Math.round(speed) + ' px/s', W - 48, 116);
+
+    if (gameOver) {
+      ctx.fillStyle = 'rgba(5,7,15,0.72)';
+      ctx.fillRect(0, 0, W, H);
+      ctx.fillStyle = '#ff4d6d';
+      ctx.font = '700 96px "DejaVu Sans Mono", monospace';
+      ctx.textAlign = 'center';
+      ctx.fillText('GAME OVER', W / 2, H / 2 - 10);
+      ctx.fillStyle = 'rgba(255,255,255,0.85)';
+      ctx.font = '400 40px "DejaVu Sans Mono", monospace';
+      ctx.fillText('score ' + score + '  —  built from one prompt', W / 2, H / 2 + 60);
+    }
+    requestAnimationFrame(frame);
+  }
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>
